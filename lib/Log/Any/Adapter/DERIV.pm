@@ -7,6 +7,7 @@ use warnings;
 # AUTHORITY
 our $VERSION = '0.001';
 
+use feature qw(state);
 use parent qw(Log::Any::Adapter::Coderef);
 
 use utf8;
@@ -100,17 +101,18 @@ use Path::Tiny;
 use curry;
 use JSON::MaybeUTF8 qw(:v1);
 use PerlIO;
+use Config;
 use Term::ANSIColor;
 use Log::Any qw($log);
-use Log::Any::Adapter::Util qw(numeric_level);
+use Fcntl qw(:DEFAULT :seek :flock);
+use Log::Any::Adapter::Util qw(numeric_level logging_methods);
 use Clone qw(clone);
 
 
 # Used for stringifying data more neatly than Data::Dumper might offer
-
 our $JSON = JSON::MaybeXS->new(
     # Multi-line for terminal output, single line if redirecting somewhere
-    pretty          => _stderr_is_tty(),
+    pretty          => _fh_is_tty(\*STDERR),
     # Be consistent
     canonical       => 1,
     # Try a bit harder to give useful output
@@ -185,7 +187,6 @@ $SIG{__DIE__} = sub {
 
 sub new {
     my ( $class, %args ) = @_;
-    $args{colour} //= _stderr_is_tty();
     my $self = $class->SUPER::new(sub { }, %args);
     # if there is json_log_file, then print json to that file
     if($self->{json_log_file}) {
@@ -198,8 +199,18 @@ sub new {
     if(!$self->{json_log_file} && !$self->{stderr}){
         $self->{stderr} = 1;
     }
-    # docker tends to prefer JSON
-    $self->{stderr} = _in_container() ? 'json' : 'text' if ($self->{stderr} && $self->{stderr} ne 'json' && $self->{stderr} ne 'text');
+
+    for my $stdfile (['stderr', \*STDERR], ['stdout', \*STDOUT]){
+        my ($name, $fh) = $stdfile->@*;
+        if($self->{$name}) {
+           $self->{$name} = {format => $self->{$name}} if ref($self->{$name}) ne 'HASH';
+           # docker tends to prefer JSON
+           $self->{$name}{format} = _in_container() ? 'json' : 'text' if (!$self->{$name}{format} || $self->{$name}{format} ne 'json' && $self->{$name}{format} ne 'text');
+           $self->apply_filehandle_utf8($fh);
+           $self->{$name}{fh} = $fh;
+           $self->{$name}{color} //= _fh_is_tty($fh);
+        }
+    }
 
     # Keep a strong reference to this, since we expect to stick around until exit anyway
     $self->{code} = $self->curry::log_entry;
@@ -278,24 +289,25 @@ sub format_line {
 sub log_entry {
     my ($self, $data) = @_;
     $data = $self->_process_data($data);
-
-    $self->{json_fh}->print(encode_json_text($data) . "\n") if $self->{json_fh};
-
-    return unless $self->{stderr};
-
-    unless($self->{has_stderr_utf8}) {
-        $self->apply_filehandle_utf8(\*STDERR);
-        $self->{has_stderr_utf8} = 1;
+    my $json_data;
+    my %text_data = ();
+    my $get_json = sub {$json_data //= encode_json_text($data) . "\n"; return $json_data;};
+    my $get_text = sub {my $color = shift // 0; $text_data{$color} //= $self->format_line($data, { color => $color }) . "\n"; return $text_data{$color};};
+    if($self->{json_fh}){
+        _lock($self->{json_fh});
+        $self->{json_fh}->print($get_json->());
+        _unlock($self->{json_fh});
     }
-
-    my $txt = $self->{stderr} eq 'json'
-    ? encode_json_text($data)
-    : $self->format_line($data, { colour => $self->{colour} });
-
-    # Regardless of the output, we always use newline separators
-    STDERR->print(
-        "$txt\n"
-    );
+    for my $stdfile (qw(stderr stdout)){
+        next unless $self->{$stdfile};
+        my $txt = $self->{$stdfile}{format} eq 'json'
+        ? $get_json->()
+        : $get_text->($self->{$stdfile}{color});
+        my $fh = $self->{$stdfile}{fh};
+        _lock($fh);
+        $fh->print($txt);
+        _unlock($fh);
+    }
 }
 
 =head2 _process_data
@@ -384,12 +396,99 @@ sub _collapse_future_stack{
     return $data;
 }
 
-sub _stderr_is_tty {
-   return -t STDERR;
+sub _fh_is_tty {
+    my $fh = shift;
+   return -t $fh;
 }
 
 sub _in_container {
     return -r '/.dockerenv';
+}
+
+=head2 _linux_flock_data
+
+Param: lock type. It can be F_WRLCK or F_UNLCK
+
+return: A FLOCK structure
+
+=cut
+
+# The following code is from https://docstore.mik.ua/orelly/perl4/cook/ch07_26.htm
+sub _linux_flock_data {
+    my ($type) = @_;
+    my $FLOCK_STRUCT = "s s l l i";
+    return pack($FLOCK_STRUCT, $type, SEEK_SET, 0, 0, 0);
+}
+
+=head2 _flock
+
+call fcntl to lock or unlock a file handle
+
+Param:
+
+=over 4
+
+=item fh - file handle
+
+=item type - lock type, either F_WRLCK or F_UNLCK
+
+=back
+
+Return : true or false
+
+=cut
+
+# We don't use `flock` function directly here
+# In some cases the program will do fork after the log file opened.
+# In such case every subprocess can get lock of the log file at the same time.
+# Using fcntl to lock a file can avoid this problem
+sub _flock {
+    my ($fh, $type) = @_;
+    my $lock = _linux_flock_data($type);
+    my $result = fcntl($fh, F_SETLKW, $lock);
+    return $result if $result;
+    print STDERR "F_SETLKW @_: $!\n";
+    return undef;
+}
+=head2 _lock
+
+Lock a file handler with fcntl.
+
+Param: fh - File handle
+
+Return: true or false
+
+=cut
+
+sub _lock{
+    my ($fh) = @_;
+    return _flock($fh, F_WRLCK);
+}
+
+=head2 _unlock
+
+Unlock a file handler locked by fcntl
+
+Param: fh - File handle
+Return: true or false
+
+=cut
+
+sub _unlock{
+    my ($fh) = @_;
+    return _flock($fh, F_UNLCK);
+}
+=head2 level
+
+return the current log level name
+
+=cut
+
+sub level {
+    my $self = shift;
+    my @methods = reverse logging_methods();
+    my %num_to_name = map {$_ => $methods[$_]} 0..$#methods;
+    return $num_to_name{$self->{log_level}};
 }
 
 1;
