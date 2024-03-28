@@ -216,6 +216,14 @@ Set the log context hash
 
 undef the log context hash
 
+## mask\_sensitive
+
+Mask sensitive data in the message and logs error in case of failure
+
+- `$message` string - The message to be masked
+
+Returns string - The masked message
+
 # AUTHOR
 
 Deriv Group Services Ltd. `DERIV@cpan.org`
